@@ -35,13 +35,13 @@ export const protect = async (req, res, next) => {
       });
     }
 
-    // Check if user is active
-    if (!user.isVerified) {
-      return res.status(401).json({
-        success: false,
-        error: 'Account not verified'
-      });
-    }
+    // Check if user is active (commented out for now to allow unverified users)
+    // if (!user.isVerified) {
+    //   return res.status(401).json({
+    //     success: false,
+    //     error: 'Account not verified'
+    //   });
+    // }
 
     req.user = user;
     next();
