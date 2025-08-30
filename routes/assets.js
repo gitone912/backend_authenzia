@@ -1,6 +1,5 @@
 import express from 'express';
 import multer from 'multer';
-import { body, validationResult } from 'express-validator';
 import { protect, optionalAuth } from '../middleware/auth.js';
 import Asset from '../models/Asset.js';
 import User from '../models/User.js';
@@ -144,36 +143,49 @@ const upload = multer({
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-router.post('/upload', protect, upload.single('file'), [
-  body('title')
-    .isLength({ min: 3, max: 100 })
-    .withMessage('Title must be between 3 and 100 characters'),
-  body('description')
-    .isLength({ min: 10, max: 1000 })
-    .withMessage('Description must be between 10 and 1000 characters'),
-  body('category')
-    .isIn(['digital-art', 'ui-design', 'photography', 'motion-graphics', 'documents', 'illustrations', '3d-models', 'audio', 'video', 'other'])
-    .withMessage('Invalid category'),
-  body('price')
-    .isFloat({ min: 0 })
-    .withMessage('Price must be a positive number'),
-  body('tags')
-    .optional()
-    .isArray({ max: 10 })
-    .withMessage('Maximum 10 tags allowed'),
-  body('license')
-    .optional()
-    .isIn(['personal', 'commercial', 'extended', 'exclusive'])
-    .withMessage('Invalid license type')
-], async (req, res) => {
+router.post('/upload', protect, upload.single('file'), async (req, res) => {
   try {
-    // Check for validation errors
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
+    // Debug: Log incoming request
+    console.log('=== Asset Upload Request ===');
+    console.log('Request body:', req.body);
+    console.log('Request file:', req.file ? {
+      filename: req.file.originalname,
+      mimetype: req.file.mimetype,
+      size: req.file.size
+    } : 'No file');
+    console.log('User:', req.user ? {
+      _id: req.user._id,
+      isCreator: req.user.isCreator
+    } : 'No user');
+    console.log('===========================');
+    
+    // Manual validation after multer processes the data
+    const { title, description, category, price, tags, license, usageRights } = req.body;
+    
+    // Validate required fields
+    const errors = [];
+    
+    if (!title || title.length < 3 || title.length > 100) {
+      errors.push({ path: 'title', msg: 'Title must be between 3 and 100 characters' });
+    }
+    
+    if (!description || description.length < 10 || description.length > 1000) {
+      errors.push({ path: 'description', msg: 'Description must be between 10 and 1000 characters' });
+    }
+    
+    if (!category || !['digital-art', 'ui-design', 'photography', 'motion-graphics', 'documents', 'illustrations', '3d-models', 'audio', 'video', 'other'].includes(category)) {
+      errors.push({ path: 'category', msg: 'Invalid category' });
+    }
+    
+    if (!price || isNaN(parseFloat(price)) || parseFloat(price) <= 0) {
+      errors.push({ path: 'price', msg: 'Price must be a positive number' });
+    }
+    
+    if (errors.length > 0) {
       return res.status(400).json({
         success: false,
         error: 'Validation failed',
-        details: errors.array()
+        details: errors
       });
     }
 
@@ -184,7 +196,35 @@ router.post('/upload', protect, upload.single('file'), [
       });
     }
 
-    const { title, description, category, price, tags, license, usageRights } = req.body;
+    // Variables are already declared above, no need to redeclare
+
+    // Parse tags from FormData - handle both array and individual tag fields
+    let parsedTags = [];
+    if (tags) {
+      if (Array.isArray(tags)) {
+        // If tags come as array from FormData
+        parsedTags = tags.filter(tag => tag && tag.trim().length > 0);
+      } else if (typeof tags === 'string') {
+        try {
+          // Try to parse as JSON if it's a string
+          const jsonTags = JSON.parse(tags);
+          if (Array.isArray(jsonTags)) {
+            parsedTags = jsonTags.filter(tag => tag && tag.trim().length > 0);
+          }
+        } catch (error) {
+          // If not JSON, treat as comma-separated string
+          parsedTags = tags.split(',').map(tag => tag.trim()).filter(tag => tag.length > 0);
+        }
+      }
+    }
+
+    // Validate tags length
+    if (parsedTags.length > 10) {
+      return res.status(400).json({
+        success: false,
+        error: 'Maximum 10 tags allowed'
+      });
+    }
 
     // Check if user is a creator
     if (!req.user.isCreator) {
@@ -249,7 +289,7 @@ router.post('/upload', protect, upload.single('file'), [
         }
 
         // Use AI suggestions if available
-        const finalTags = tags || contentAnalysis.tags || [];
+        const finalTags = parsedTags.length > 0 ? parsedTags : (contentAnalysis.tags || []);
         const finalCategory = category || contentAnalysis.category || 'other';
         const finalDescription = description || contentAnalysis.description;
 
@@ -288,7 +328,7 @@ router.post('/upload', protect, upload.single('file'), [
       description,
       creator: req.user._id,
       category,
-      tags: tags || [],
+      tags: parsedTags,
       price: parseFloat(price),
       license: license || 'personal',
       usageRights: usageRights || [],
@@ -584,6 +624,34 @@ router.put('/:id', protect, [
 
     const { title, description, price, tags, category, license } = req.body;
 
+    // Parse tags from FormData - handle both array and individual tag fields
+    let parsedTags = [];
+    if (tags) {
+      if (Array.isArray(tags)) {
+        // If tags come as array from FormData
+        parsedTags = tags.filter(tag => tag && tag.trim().length > 0);
+      } else if (typeof tags === 'string') {
+        try {
+          // Try to parse as JSON if it's a string
+          const jsonTags = JSON.parse(tags);
+          if (Array.isArray(jsonTags)) {
+            parsedTags = jsonTags.filter(tag => tag && tag.trim().length > 0);
+          }
+        } catch (error) {
+          // If not JSON, treat as comma-separated string
+          parsedTags = tags.split(',').map(tag => tag.trim()).filter(tag => tag.length > 0);
+        }
+      }
+    }
+
+    // Validate tags length
+    if (parsedTags.length > 10) {
+      return res.status(400).json({
+        success: false,
+        error: 'Maximum 10 tags allowed'
+      });
+    }
+
     // Update asset
     const updatedAsset = await Asset.findByIdAndUpdate(
       req.params.id,
@@ -591,7 +659,7 @@ router.put('/:id', protect, [
         title,
         description,
         price: price ? parseFloat(price) : undefined,
-        tags,
+        tags: parsedTags,
         category,
         license
       },
