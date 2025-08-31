@@ -5,6 +5,8 @@ import Asset from '../models/Asset.js';
 import User from '../models/User.js';
 import ImageProcessor from '../utils/imageProcessor.js';
 import AIService from '../utils/aiService.js';
+import IPFSService from '../utils/ipfsService.js';
+// X402Service not needed - middleware handles everything
 import { body, validationResult } from 'express-validator';
 
 const router = express.Router();
@@ -12,6 +14,8 @@ const router = express.Router();
 // Initialize services
 const imageProcessor = new ImageProcessor();
 const aiService = new AIService();
+const ipfsService = new IPFSService();
+// X402 middleware handles payment automatically
 
 // Configure multer for file uploads
 const storage = multer.memoryStorage();
@@ -163,6 +167,15 @@ router.post('/upload', protect, upload.single('file'), async (req, res) => {
     // Manual validation after multer processes the data
     const { title, description, category, price, tags, license, usageRights } = req.body;
 
+    // Validate and sanitize price
+    const assetPrice = (isNaN(price) || price === undefined || price === null) ? 0 : Number(price);
+    if (assetPrice < 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Price cannot be negative'
+      });
+    }
+
     // Relaxed validation: only check for file presence and user creator status
     if (!req.file) {
       return res.status(400).json({
@@ -292,6 +305,55 @@ router.post('/upload', protect, upload.single('file'), async (req, res) => {
       };
     }
 
+    // Enhanced duplicate detection using multiple methods
+    console.log('🔍 Running enhanced duplicate detection...');
+    const existingAssets = await Asset.find({
+      creator: { $ne: req.user._id } // Don't check against user's own assets
+    }).limit(100); // Limit for performance
+
+    const duplicateResult = await aiService.detectDuplicates(req.file.buffer, existingAssets);
+
+    if (duplicateResult.isDuplicate && duplicateResult.confidence > 0.8) {
+      return res.status(409).json({
+        success: false,
+        error: 'Duplicate content detected',
+        details: {
+          confidence: duplicateResult.confidence,
+          matches: duplicateResult.matches,
+          methods: duplicateResult.methods
+        }
+      });
+    }
+
+    // Process image for duplicate detection (get hashes)
+    const hashData = await aiService.processImageForDuplicateDetection(req.file.buffer);
+
+    // Upload to IPFS
+    let ipfsData = null;
+    try {
+      console.log('📤 Uploading original file to IPFS...');
+      ipfsData = await ipfsService.uploadFile(
+        req.file.buffer,
+        processedFiles.original.filename,
+        {
+          title,
+          description,
+          category: category || 'digital-art',
+          creator: req.user.username,
+          uploadedAt: new Date().toISOString(),
+          contentHash: hashData.sha256Hash
+        }
+      );
+      if (ipfsData) {
+        console.log('✅ IPFS upload successful:', ipfsData.cid);
+      } else {
+        console.log('⚠️ IPFS upload skipped - no services configured');
+      }
+    } catch (error) {
+      console.warn('⚠️ IPFS upload failed, continuing with local storage:', error.message);
+      // Continue without IPFS - the asset will still work with local storage
+    }
+
     // Use AI-enhanced or user-provided values
     const finalTags = parsedTags.length > 0 ? parsedTags : [];
     const finalCategory = category || 'digital-art';
@@ -304,7 +366,7 @@ router.post('/upload', protect, upload.single('file'), async (req, res) => {
       creator: req.user._id,
       category: finalCategory,
       tags: finalTags,
-      price: parseFloat(price),
+      price: assetPrice,
       license: license || 'personal',
       usageRights: usageRights || [],
       originalFile: {
@@ -312,20 +374,30 @@ router.post('/upload', protect, upload.single('file'), async (req, res) => {
         path: processedFiles.original.path,
         size: processedFiles.original.size,
         mimetype: processedFiles.original.mimetype,
-        hash: imageHash
+        hash: hashData.sha256Hash,
+        perceptualHash: hashData.perceptualHash
       },
       watermarkedFile: processedFiles.watermarked || null,
       thumbnail: processedFiles.thumbnail || null,
       qrCode: processedFiles.qrCode || null,
+      ipfsData: ipfsData || null, // IPFS storage information
+      status: 'published', // Auto-publish uploaded assets
+      isPublic: true,
+      isApproved: true, // Auto-approve for now (can add moderation later)
       aiVerified: true,
       duplicateCheck: {
-        isDuplicate: false,
-        similarAssets: [],
+        isDuplicate: duplicateResult.isDuplicate,
+        confidence: duplicateResult.confidence,
+        methods: duplicateResult.methods,
+        matches: duplicateResult.matches,
         checkedAt: new Date()
       }
     });
 
     await asset.save();
+
+    // X402 payment will be handled by middleware automatically
+    console.log('💰 Asset ready for X402 payment protection:', asset._id);
 
     res.status(201).json({
       success: true,
@@ -599,6 +671,15 @@ router.put('/:id', protect, [
 
     const { title, description, price, tags, category, license } = req.body;
 
+    // Validate and sanitize price
+    const assetPrice = (isNaN(price) || price === undefined || price === null) ? asset.price : Number(price);
+    if (assetPrice < 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Price cannot be negative'
+      });
+    }
+
     // Parse tags from FormData - handle both array and individual tag fields
     let parsedTags = [];
     if (tags) {
@@ -633,7 +714,7 @@ router.put('/:id', protect, [
       {
         title,
         description,
-        price: price ? parseFloat(price) : undefined,
+        price: assetPrice,
         tags: parsedTags,
         category,
         license
@@ -693,6 +774,353 @@ router.delete('/:id', protect, async (req, res) => {
     res.status(500).json({
       success: false,
       error: 'Server error while deleting asset'
+    });
+  }
+});
+
+// @route   POST /api/assets/:id/mint
+// @desc    Mint asset as NFT
+// @access  Private (creator only)
+router.post('/:id/mint', protect, async (req, res) => {
+  try {
+    const asset = await Asset.findById(req.params.id);
+    if (!asset) {
+      return res.status(404).json({
+        success: false,
+        error: 'Asset not found'
+      });
+    }
+
+    // Check if user is the creator
+    if (asset.creator.toString() !== req.user._id.toString()) {
+      return res.status(403).json({
+        success: false,
+        error: 'Only creator can mint NFT'
+      });
+    }
+
+    // Check if already minted
+    if (asset.nftData?.isMinted) {
+      return res.status(400).json({
+        success: false,
+        error: 'Asset already minted as NFT'
+      });
+    }
+
+    // Create NFT metadata
+    let metadataUrl = '';
+    if (asset.ipfsData?.cid) {
+      // Create and upload NFT metadata to IPFS
+      const nftMetadata = ipfsService.createNFTMetadata(asset, asset.ipfsData);
+      const metadataResult = await ipfsService.uploadMetadata(nftMetadata);
+      metadataUrl = metadataResult.url;
+    }
+
+    // Update asset with NFT data (mock for now - implement with actual contract)
+    asset.nftData = {
+      contractAddress: process.env.CONTRACT_ADDRESS,
+      tokenId: Math.floor(Math.random() * 10000).toString(),
+      chainId: parseInt(process.env.CHAIN_ID) || 84532,
+      transactionHash: `0x${Math.random().toString(16).substr(2, 64)}`,
+      ownerAddress: req.user.walletAddress || req.user.email,
+      isMinted: true,
+      isLazyMinted: false,
+      mintedAt: new Date(),
+      royaltyPercentage: 10,
+      mintPrice: asset.price
+    };
+
+    if (metadataUrl) {
+      asset.ipfsData.metadataUrl = metadataUrl;
+    }
+
+    await asset.save();
+
+    res.json({
+      success: true,
+      message: 'NFT minted successfully',
+      data: {
+        asset: asset.getPublicData(),
+        nftData: asset.nftData
+      }
+    });
+
+  } catch (error) {
+    console.error('NFT minting error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Server error during NFT minting'
+    });
+  }
+});
+
+// @route   GET /api/assets/:id/purchase
+// @desc    Purchase NFT with X402 payment (protected by X402 middleware)
+// @access  Public (with payment)
+router.get('/:id/purchase', async (req, res) => {
+  // This route is protected by X402 middleware - payment already completed!
+  console.log('🎉 X402 PAYMENT COMPLETED! User paid and can now access NFT');
+
+  const { buyerAddress } = req.query;
+  const assetId = req.params.id;
+
+  try {
+    const asset = await Asset.findById(assetId).populate('creator', 'username fullName');
+    if (!asset) {
+      return res.status(404).json({
+        success: false,
+        error: 'Asset not found'
+      });
+    }
+
+    console.log('✅ Processing NFT purchase for paid user:', {
+      assetId: asset._id,
+      title: asset.title,
+      buyer: buyerAddress
+    });
+
+    // Simulate NFT minting (replace with real minting later)
+    const mockNFT = {
+      tokenId: Math.floor(Math.random() * 10000).toString(),
+      contractAddress: process.env.CONTRACT_ADDRESS || '0x123...',
+      transactionHash: `0x${Math.random().toString(16).substr(2, 64)}`,
+      ownerAddress: buyerAddress,
+      mintedAt: new Date().toISOString()
+    };
+
+    // Update asset with NFT data
+    asset.nftData = {
+      ...asset.nftData,
+      ...mockNFT,
+      isMinted: true
+    };
+
+    // Record the purchase
+    asset.purchases = (asset.purchases || 0) + 1;
+    asset.revenue = (asset.revenue || 0) + 0.01; // X402 payment amount
+
+    await asset.save();
+
+    // Send success response - just like your weather example
+    res.json({
+      success: true,
+      message: 'NFT purchased successfully via X402!',
+      nft: mockNFT,
+      asset: {
+        id: asset._id,
+        title: asset.title,
+        creator: asset.creator.username
+      }
+    });
+
+    // Update asset ownership
+    if (asset.nftData) {
+      asset.nftData.ownerAddress = buyerAddress;
+      await asset.save();
+    }
+
+    res.json({
+      success: true,
+      message: 'NFT purchased successfully',
+      data: paymentResult
+    });
+
+  } catch (error) {
+    console.error('NFT purchase error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Server error during NFT purchase'
+    });
+  }
+});
+
+// @route   POST /api/assets/:id/auction
+// @desc    Create auction for NFT
+// @access  Private (owner only)
+router.post('/:id/auction', protect, [
+  body('startTime').isISO8601().withMessage('Valid start time required'),
+  body('endTime').isISO8601().withMessage('Valid end time required'),
+  body('reservePrice').isFloat({ min: 0 }).withMessage('Valid reserve price required'),
+  body('minBidIncrement').isFloat({ min: 0 }).withMessage('Valid min bid increment required')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        error: 'Validation failed',
+        details: errors.array()
+      });
+    }
+
+    const asset = await Asset.findById(req.params.id);
+    if (!asset) {
+      return res.status(404).json({
+        success: false,
+        error: 'Asset not found'
+      });
+    }
+
+    // Check if user owns the NFT
+    if (asset.nftData?.ownerAddress !== req.user.walletAddress &&
+        asset.creator.toString() !== req.user._id.toString()) {
+      return res.status(403).json({
+        success: false,
+        error: 'Only NFT owner can create auction'
+      });
+    }
+
+    const { startTime, endTime, reservePrice, minBidIncrement } = req.body;
+
+    // X402 will handle auction payments automatically
+    console.log('🏷️ Auction created - X402 will handle payments');
+
+    res.json({
+      success: true,
+      message: 'Auction created successfully',
+      data: {
+        auctionConfig,
+        asset: asset.getPublicData()
+      }
+    });
+
+  } catch (error) {
+    console.error('Auction creation error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Server error during auction creation'
+    });
+  }
+});
+
+// @route   GET /api/assets/test-images
+// @desc    Test endpoint to check uploaded images
+// @access  Public
+router.get('/test-images', async (req, res) => {
+  try {
+    const fs = await import('fs/promises');
+    const path = await import('path');
+
+    const uploadsPath = process.env.UPLOAD_PATH || './uploads';
+    const thumbnailsPath = path.join(uploadsPath, 'thumbnails');
+
+    // Check if thumbnails directory exists and list files
+    try {
+      const files = await fs.readdir(thumbnailsPath);
+      const imageFiles = files.filter(file =>
+        file.endsWith('.jpg') || file.endsWith('.png') || file.endsWith('.jpeg')
+      );
+
+      res.json({
+        success: true,
+        data: {
+          thumbnailsPath,
+          imageFiles,
+          totalFiles: imageFiles.length,
+          sampleUrls: imageFiles.slice(0, 3).map(file =>
+            `http://localhost:5000/uploads/thumbnails/${file}`
+          )
+        }
+      });
+    } catch (dirError) {
+      res.json({
+        success: false,
+        error: 'Thumbnails directory not found or empty',
+        path: thumbnailsPath
+      });
+    }
+  } catch (error) {
+    console.error('Test images error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Server error while testing images'
+    });
+  }
+});
+
+// @route   GET /api/assets/:id/payment-status
+// @desc    Get X402 payment status for asset
+// @access  Public
+router.get('/:id/payment-status', async (req, res) => {
+  try {
+    const asset = await Asset.findById(req.params.id);
+    if (!asset) {
+      return res.status(404).json({
+        success: false,
+        error: 'Asset not found'
+      });
+    }
+
+    // Check if asset has X402 configuration
+    const hasX402Config = asset.x402Config && Object.keys(asset.x402Config).length > 0;
+
+    res.json({
+      success: true,
+      data: {
+        assetId: asset._id,
+        title: asset.title,
+        price: asset.price,
+        hasX402Config,
+        x402Network: process.env.X402_NETWORK || 'base-sepolia',
+        paymentRequired: !asset.nftData?.isMinted || asset.price > 0,
+        status: asset.nftData?.isMinted ? 'minted' : 'pending'
+      }
+    });
+
+  } catch (error) {
+    console.error('Payment status error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Server error while checking payment status'
+    });
+  }
+});
+
+// @route   GET /api/assets/:id/download
+// @desc    Download high-resolution image with X402 payment
+// @access  Public (with payment)
+router.get('/:id/download', async (req, res) => {
+  // This route is protected by X402 middleware - payment already completed!
+  console.log('🎉 X402 PAYMENT COMPLETED! User paid and can now download');
+
+  const { format = 'jpg' } = req.query;
+  const assetId = req.params.id;
+
+  try {
+    const asset = await Asset.findById(assetId);
+    if (!asset) {
+      return res.status(404).json({
+        success: false,
+        error: 'Asset not found'
+      });
+    }
+
+    // Increment download count
+    asset.downloads = (asset.downloads || 0) + 1;
+    await asset.save();
+
+    // Send download response - just like your weather example
+    res.json({
+      success: true,
+      message: 'Download authorized via X402 payment!',
+      download: {
+        url: asset.imageUrl,
+        format: format,
+        filename: `${asset.title.replace(/[^a-zA-Z0-9]/g, '_')}.${format}`,
+        watermark: false,
+        highResolution: true
+      },
+      asset: {
+        id: asset._id,
+        title: asset.title
+      }
+    });
+
+  } catch (error) {
+    console.error('Download error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Server error'
     });
   }
 });

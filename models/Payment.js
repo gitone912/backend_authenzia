@@ -9,7 +9,7 @@ const paymentSchema = new mongoose.Schema({
   buyer: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',
-    required: [true, 'Buyer is required']
+    required: false // Make optional since we have buyerAddress
   },
   seller: {
     type: mongoose.Schema.Types.ObjectId,
@@ -25,13 +25,42 @@ const paymentSchema = new mongoose.Schema({
   },
   currency: {
     type: String,
-    default: 'USD',
-    enum: ['USD', 'EUR', 'GBP', 'CAD', 'AUD']
+    default: 'USDC',
+    enum: ['USD', 'EUR', 'GBP', 'CAD', 'AUD', 'USDC', 'ETH', 'MATIC']
   },
   paymentMethod: {
     type: String,
-    enum: ['coinbase', 'stripe', 'paypal', 'manual'],
-    default: 'coinbase'
+    enum: ['coinbase', 'stripe', 'paypal', 'manual', 'x402', 'direct', 'auction'],
+    default: 'x402'
+  },
+
+  // Blockchain specific fields
+  buyerAddress: {
+    type: String,
+    lowercase: true
+  },
+  sellerAddress: {
+    type: String,
+    lowercase: true
+  },
+  network: {
+    type: String,
+    enum: ['base-sepolia', 'base-mainnet', 'ethereum', 'polygon'],
+    default: 'base-sepolia'
+  },
+  transactionHash: {
+    type: String,
+    unique: true,
+    sparse: true
+  },
+  blockNumber: {
+    type: Number
+  },
+  tokenId: {
+    type: String
+  },
+  contractAddress: {
+    type: String
   },
   
   // Transaction details
@@ -95,7 +124,7 @@ const paymentSchema = new mongoose.Schema({
 // Indexes for performance
 paymentSchema.index({ asset: 1, buyer: 1 });
 paymentSchema.index({ seller: 1, paymentStatus: 1 });
-paymentSchema.index({ transactionId: 1 });
+// Removed duplicate transactionId index (already defined in schema)
 paymentSchema.index({ createdAt: -1 });
 paymentSchema.index({ paymentStatus: 1, createdAt: -1 });
 
@@ -139,11 +168,24 @@ paymentSchema.methods.markFileSent = function() {
   return this.save();
 };
 
+// Pre-save middleware to ensure numeric fields are valid
+paymentSchema.pre('save', function(next) {
+  // Fix numeric fields that might be NaN or undefined
+  this.amount = (isNaN(this.amount) || this.amount === undefined) ? 0 : Number(this.amount);
+  this.platformFee = (isNaN(this.platformFee) || this.platformFee === undefined) ? 0 : Number(this.platformFee);
+  this.creatorAmount = (isNaN(this.creatorAmount) || this.creatorAmount === undefined) ? 0 : Number(this.creatorAmount);
+
+  next();
+});
+
 // Method to calculate platform fees (example: 10% platform fee)
 paymentSchema.methods.calculateFees = function() {
-  this.platformFee = Math.round(this.amount * 0.1 * 100) / 100; // 10% fee
-  this.creatorAmount = this.amount - this.platformFee;
-  
+  // Ensure amount is a valid number
+  const amount = (isNaN(this.amount) || this.amount === undefined) ? 0 : Number(this.amount);
+
+  this.platformFee = Math.round(amount * 0.1 * 100) / 100; // 10% fee
+  this.creatorAmount = amount - this.platformFee;
+
   return this.save();
 };
 

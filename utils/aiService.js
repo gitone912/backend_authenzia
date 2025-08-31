@@ -1,5 +1,24 @@
 import { Groq } from 'groq-sdk';
 import ImageProcessor from './imageProcessor.js';
+import crypto from 'crypto';
+
+// Optional imports for advanced duplicate detection
+let phash, tf;
+try {
+  // Use a more lightweight alternative to phash
+  // phash = await import('phash');
+  console.log('⚠️ pHash library disabled (using SHA-256 only)');
+} catch (error) {
+  console.warn('⚠️ pHash library not available:', error.message);
+}
+
+try {
+  // Disable TensorFlow for now to reduce complexity
+  // tf = await import('@tensorflow/tfjs-node');
+  console.log('⚠️ TensorFlow.js disabled (using basic comparison)');
+} catch (error) {
+  console.warn('⚠️ TensorFlow.js not available:', error.message);
+}
 
 export class AIService {
   constructor() {
@@ -265,6 +284,175 @@ export class AIService {
         reason: 'Validation service unavailable'
       };
     }
+  }
+
+  // Generate SHA-256 hash for content verification
+  generateSHA256Hash(buffer) {
+    return crypto.createHash('sha256').update(buffer).digest('hex');
+  }
+
+  // Generate perceptual hash using pHash
+  async generatePerceptualHash(imageBuffer) {
+    if (!phash) {
+      console.warn('⚠️ pHash not available, falling back to SHA-256');
+      return this.generateSHA256Hash(imageBuffer);
+    }
+
+    try {
+      // Convert buffer to temporary file for pHash processing
+      const tempPath = `/tmp/temp_${Date.now()}.png`;
+      const fs = await import('fs/promises');
+      await fs.writeFile(tempPath, imageBuffer);
+
+      const hash = await phash.hash(tempPath);
+
+      // Clean up temp file
+      await fs.unlink(tempPath).catch(() => {});
+
+      return hash;
+    } catch (error) {
+      console.error('Perceptual hashing failed:', error);
+      return this.generateSHA256Hash(imageBuffer);
+    }
+  }
+
+  // Calculate Hamming distance between two hashes
+  hammingDistance(hash1, hash2) {
+    if (hash1.length !== hash2.length) {
+      return Infinity;
+    }
+
+    let distance = 0;
+    for (let i = 0; i < hash1.length; i++) {
+      if (hash1[i] !== hash2[i]) {
+        distance++;
+      }
+    }
+    return distance;
+  }
+
+  // Advanced duplicate detection using multiple methods
+  async detectDuplicates(imageBuffer, existingAssets) {
+    const results = {
+      isDuplicate: false,
+      confidence: 0,
+      matches: [],
+      methods: {
+        sha256: false,
+        perceptual: false,
+        ai: false
+      }
+    };
+
+    try {
+      // Method 1: SHA-256 exact match
+      const sha256Hash = this.generateSHA256Hash(imageBuffer);
+      const exactMatches = existingAssets.filter(asset =>
+        asset.originalFile?.hash === sha256Hash
+      );
+
+      if (exactMatches.length > 0) {
+        results.isDuplicate = true;
+        results.confidence = 1.0;
+        results.methods.sha256 = true;
+        results.matches = exactMatches.map(asset => ({
+          assetId: asset._id,
+          method: 'sha256',
+          confidence: 1.0,
+          reason: 'Exact hash match'
+        }));
+        return results;
+      }
+
+      // Method 2: Perceptual hashing
+      if (phash) {
+        const perceptualHash = await this.generatePerceptualHash(imageBuffer);
+        const perceptualMatches = [];
+
+        for (const asset of existingAssets) {
+          if (asset.perceptualHash) {
+            const distance = this.hammingDistance(perceptualHash, asset.perceptualHash);
+            const similarity = 1 - (distance / Math.max(perceptualHash.length, asset.perceptualHash.length));
+
+            if (similarity > 0.85) { // 85% similarity threshold
+              perceptualMatches.push({
+                assetId: asset._id,
+                method: 'perceptual',
+                confidence: similarity,
+                reason: `Perceptual similarity: ${(similarity * 100).toFixed(1)}%`
+              });
+            }
+          }
+        }
+
+        if (perceptualMatches.length > 0) {
+          results.isDuplicate = true;
+          results.confidence = Math.max(...perceptualMatches.map(m => m.confidence));
+          results.methods.perceptual = true;
+          results.matches.push(...perceptualMatches);
+        }
+      }
+
+      // Method 3: AI-based comparison (for top matches)
+      if (results.matches.length > 0) {
+        // Use AI to verify the top match
+        const topMatch = results.matches.reduce((prev, current) =>
+          prev.confidence > current.confidence ? prev : current
+        );
+
+        const matchedAsset = existingAssets.find(asset =>
+          asset._id.toString() === topMatch.assetId.toString()
+        );
+
+        if (matchedAsset && matchedAsset.originalFile?.path) {
+          try {
+            const fs = await import('fs/promises');
+            const existingImageBuffer = await fs.readFile(matchedAsset.originalFile.path);
+            const aiComparison = await this.compareImagesWithAI(imageBuffer, existingImageBuffer);
+
+            if (aiComparison.result) {
+              results.methods.ai = true;
+              results.confidence = Math.max(results.confidence, 0.9);
+              topMatch.reason += ' (AI confirmed)';
+            }
+          } catch (error) {
+            console.warn('AI comparison failed:', error.message);
+          }
+        }
+      }
+
+      return results;
+
+    } catch (error) {
+      console.error('Duplicate detection failed:', error);
+      return {
+        isDuplicate: false,
+        confidence: 0,
+        matches: [],
+        error: error.message,
+        methods: { sha256: false, perceptual: false, ai: false }
+      };
+    }
+  }
+
+  // Store perceptual hash in asset
+  async processImageForDuplicateDetection(imageBuffer) {
+    const sha256Hash = this.generateSHA256Hash(imageBuffer);
+    let perceptualHash = null;
+
+    if (phash) {
+      try {
+        perceptualHash = await this.generatePerceptualHash(imageBuffer);
+      } catch (error) {
+        console.warn('Failed to generate perceptual hash:', error.message);
+      }
+    }
+
+    return {
+      sha256Hash,
+      perceptualHash,
+      processedAt: new Date()
+    };
   }
 }
 

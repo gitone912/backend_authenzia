@@ -91,9 +91,15 @@ router.post('/create', [
     .withMessage('Valid amount is required')
 ], async (req, res) => {
   try {
+    console.log('💰 Payment creation request:', {
+      body: req.body,
+      headers: req.headers.authorization ? 'Present' : 'Missing'
+    });
+
     // Check for validation errors
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
+      console.log('❌ Validation errors:', errors.array());
       return res.status(400).json({
         success: false,
         error: 'Validation failed',
@@ -106,15 +112,33 @@ router.post('/create', [
     // Check if asset exists and is available
     const asset = await Asset.findById(assetId)
       .populate('creator', 'username fullName');
-    
+
     if (!asset) {
+      console.log('❌ Asset not found:', assetId);
       return res.status(404).json({
         success: false,
         error: 'Asset not found'
       });
     }
 
-    if (!asset.isPublic || asset.status !== 'published') {
+    console.log('✅ Asset found:', {
+      id: asset._id,
+      title: asset.title,
+      price: asset.price,
+      isPublic: asset.isPublic,
+      status: asset.status
+    });
+
+    // Check asset availability - be more lenient for development
+    const isPublic = asset.isPublic !== false; // Default to true if undefined
+    const status = asset.status || 'published'; // Default to published if undefined
+
+    if (!isPublic || (status !== 'published' && status !== 'active')) {
+      console.log('❌ Asset not available:', {
+        isPublic: asset.isPublic,
+        status: asset.status,
+        computed: { isPublic, status }
+      });
       return res.status(400).json({
         success: false,
         error: 'Asset is not available for purchase'
@@ -122,10 +146,23 @@ router.post('/create', [
     }
 
     // Validate amount matches asset price
-    if (Math.abs(amount - asset.price) > 0.01) { // Allow small floating point differences
+    const assetPrice = (isNaN(asset.price) || asset.price === undefined) ? 0 : Number(asset.price);
+    const paymentAmount = (isNaN(amount) || amount === undefined) ? 0 : Number(amount);
+
+    console.log('💰 Price validation:', {
+      assetPrice,
+      paymentAmount,
+      difference: Math.abs(paymentAmount - assetPrice)
+    });
+
+    if (Math.abs(paymentAmount - assetPrice) > 0.01) { // Allow small floating point differences
+      console.log('❌ Price mismatch:', {
+        expected: assetPrice,
+        received: paymentAmount
+      });
       return res.status(400).json({
         success: false,
-        error: 'Amount does not match asset price'
+        error: `Amount does not match asset price. Expected: $${assetPrice}, Received: $${paymentAmount}`
       });
     }
 
@@ -143,12 +180,32 @@ router.post('/create', [
       }
     }
 
+    // Additional validation for asset price (already declared above)
+    console.log('💰 Final asset price validation:', {
+      originalPrice: asset.price,
+      computedPrice: assetPrice,
+      isValid: assetPrice >= 0
+    });
+
+    if (assetPrice < 0) {
+      console.log('❌ Invalid asset price:', assetPrice);
+      return res.status(400).json({
+        success: false,
+        error: 'Asset price cannot be negative'
+      });
+    }
+
+    // Allow free assets (price = 0) for development
+    if (assetPrice === 0) {
+      console.log('ℹ️ Processing free asset purchase');
+    }
+
     // Create payment record
     const payment = new Payment({
       asset: assetId,
       buyer: buyer ? buyer._id : null,
       seller: asset.creator._id,
-      amount: asset.price,
+      amount: assetPrice,
       currency: asset.currency || 'USD',
       paymentMethod: 'coinbase', // Placeholder for future integration
       deliveryEmail: email,
@@ -247,11 +304,13 @@ router.post('/:paymentId/process', [
     await payment.grantAccess();
 
     // Update asset statistics
-    await payment.asset.recordPurchase(payment.amount);
+    const purchaseAmount = (isNaN(payment.amount) || payment.amount === undefined) ? 0 : Number(payment.amount);
+    await payment.asset.recordPurchase(purchaseAmount);
 
     // Update seller earnings
+    const creatorAmount = (isNaN(payment.creatorAmount) || payment.creatorAmount === undefined) ? 0 : Number(payment.creatorAmount);
     await User.findByIdAndUpdate(payment.seller._id, {
-      $inc: { totalEarnings: payment.creatorAmount, totalSales: 1 }
+      $inc: { totalEarnings: creatorAmount, totalSales: 1 }
     });
 
     // TODO: Send email with download link
@@ -522,6 +581,35 @@ router.get('/stats/:userId', protect, async (req, res) => {
     res.status(500).json({
       success: false,
       error: 'Server error while fetching payment stats'
+    });
+  }
+});
+
+// @route   POST /api/payments/test
+// @desc    Test payment creation (development only)
+// @access  Public
+router.post('/test', async (req, res) => {
+  try {
+    console.log('🧪 Test payment endpoint called:', req.body);
+
+    res.json({
+      success: true,
+      message: 'Payment API is working',
+      data: {
+        timestamp: new Date().toISOString(),
+        body: req.body,
+        headers: {
+          authorization: req.headers.authorization ? 'Present' : 'Missing',
+          contentType: req.headers['content-type']
+        }
+      }
+    });
+  } catch (error) {
+    console.error('Test payment error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Test payment failed',
+      details: error.message
     });
   }
 });

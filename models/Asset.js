@@ -56,7 +56,19 @@ const assetSchema = new mongoose.Schema({
     path: String,
     size: Number,
     mimetype: String,
-    hash: String // For duplicate detection
+    hash: String, // SHA-256 hash for duplicate detection
+    perceptualHash: String // pHash for similarity detection
+  },
+
+  // IPFS storage information
+  ipfsData: {
+    cid: String, // IPFS Content Identifier
+    url: String, // IPFS gateway URL
+    gateway: String, // Gateway used
+    provider: String, // web3.storage, pinata, etc.
+    hash: String, // SHA-256 hash
+    metadataCid: String, // CID of NFT metadata JSON
+    metadataUrl: String // URL of NFT metadata JSON
   },
   watermarkedFile: {
     filename: String,
@@ -141,6 +153,26 @@ const assetSchema = new mongoose.Schema({
     default: 'personal'
   },
   usageRights: [String],
+
+  // Blockchain/NFT information
+  nftData: {
+    contractAddress: String, // Smart contract address
+    tokenId: String, // NFT token ID
+    chainId: Number, // Blockchain network ID
+    transactionHash: String, // Minting transaction hash
+    ownerAddress: String, // Current NFT owner
+    isMinted: { type: Boolean, default: false },
+    isLazyMinted: { type: Boolean, default: false },
+    mintedAt: Date,
+    royaltyPercentage: { type: Number, default: 10 }, // Creator royalty %
+    mintPrice: Number // Price at which NFT was minted
+  },
+
+  // X402 payment configuration
+  x402Config: {
+    type: Object,
+    default: {}
+  },
   
   // Moderation
   moderationStatus: {
@@ -189,10 +221,29 @@ assetSchema.methods.incrementDownloads = function() {
   return this.save();
 };
 
+// Pre-save middleware to ensure numeric fields are valid
+assetSchema.pre('save', function(next) {
+  // Fix numeric fields that might be NaN or undefined
+  this.price = (isNaN(this.price) || this.price === undefined) ? 0 : Number(this.price);
+  this.views = (isNaN(this.views) || this.views === undefined) ? 0 : Number(this.views);
+  this.downloads = (isNaN(this.downloads) || this.downloads === undefined) ? 0 : Number(this.downloads);
+  this.purchases = (isNaN(this.purchases) || this.purchases === undefined) ? 0 : Number(this.purchases);
+  this.revenue = (isNaN(this.revenue) || this.revenue === undefined) ? 0 : Number(this.revenue);
+
+  next();
+});
+
 // Method to record purchase
 assetSchema.methods.recordPurchase = function(amount) {
+  // Ensure purchases is a valid number, default to 0 if undefined or NaN
+  this.purchases = (isNaN(this.purchases) || this.purchases === undefined) ? 0 : this.purchases;
   this.purchases += 1;
-  this.revenue += amount;
+
+  // Ensure revenue is a valid number, default to 0 if undefined or NaN
+  this.revenue = (isNaN(this.revenue) || this.revenue === undefined) ? 0 : this.revenue;
+  const purchaseAmount = (isNaN(amount) || amount === undefined) ? 0 : Number(amount);
+  this.revenue += purchaseAmount;
+
   return this.save();
 };
 
