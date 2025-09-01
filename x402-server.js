@@ -9,7 +9,7 @@ app.use(paymentMiddleware(
   {  // Route configurations for protected endpoints
     "GET /weather": {
       // USDC amount in dollars
-      price: "$0.0000001",
+      price: "$0.001",
       network: "base-sepolia", // for mainnet, see Running on Mainnet section
       // Optional: Add metadata for better discovery in x402 Bazaar
       config: {
